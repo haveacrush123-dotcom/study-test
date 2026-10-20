@@ -1,0 +1,933 @@
+"""
+career_tab.py  -  진로·대입 연계 탭 (대입 정보 API + 생기부 방향 정리)
+=====================================================================
+기능팀 3개 기능 중 하나입니다. 이 파일은 '탭 하나'만 만듭니다.
+
+  1) 대입 정보 API   : 대학 이름을 검색하면 공공데이터(대학알리미·입학정원)에서 바로 가져와요.
+                       계열별 입학정원 막대에서 '내 희망 계열'을 강조해요.
+  2) 생기부 방향 정리 : 학생이 직접 적은 활동(발표·탐구·특강 …)을 희망 진로와 이어서 정리해요.
+                       평가·합격 가능성 판단은 하지 않아요.
+  두 기능은 '희망 계열'로 이어져요. (같은 계열 기준으로 대학 정원과 내 활동 수를 나란히 보여줘요)
+
+메인팀 앱에 붙이는 법 (Streamlit)
+---------------------------------------------------------------------
+1. 이 파일을 메인팀 앱 폴더에 복사합니다.
+2. 아래 ID_SESSION_KEYS 를 메인팀이 로그인 정보를 담아두는 st.session_state 키 이름으로 맞춥니다.
+     - 학번과 이름을 따로 담으면:  ID_SESSION_KEYS = ["student_id", "student_name"]
+     - 학생증 코드 하나면:          ID_SESSION_KEYS = ["student_code"]
+3. 메인팀 앱의 원하는 자리에서:
+       import career_tab
+       career_tab.render_career_tab()
+4. 혼자 테스트:   streamlit run career_tab.py   (단독 실행하면 학번/이름 입력칸이 자동으로 나와요)
+
+환경변수 / st.secrets (코드에 직접 적지 마세요)
+---------------------------------------------------------------------
+  DATA_GO_KR_KEY   공공데이터포털에서 받은 인증키
+  CAREER_SALT      학생 식별값 해시용 비밀 문자열 (꼭 바꾸세요, 한 번 정하면 바꾸지 마세요)
+  CAREER_DB_PATH   DB 파일 위치 (기본 career_tab.db)
+  CAREER_DEV       1 이면 메인 앱에 붙인 상태에서도 테스트용 로그인 입력칸을 보여줘요 (배포에서는 지우세요)
+
+개인정보 원칙
+---------------------------------------------------------------------
+  - 학번·이름·학생증 코드는 저장하지 않습니다. salt를 섞은 해시값만 DB에 둡니다.
+  - 활동 기록은 본인만 볼 수 있습니다. (관리자 화면에도 나오지 않아요)
+"""
+from __future__ import annotations
+
+import hashlib
+import html
+import json
+import os
+import re
+import sqlite3
+import time
+import xml.etree.ElementTree as ET
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
+from urllib import parse as urlparse
+from urllib import request as urlrequest
+
+import streamlit as st
+
+# =====================================================================
+# 0. 설정
+# =====================================================================
+# TODO(메인팀과 맞출 곳): 메인팀 로그인이 정보를 담아두는 session_state 키들.
+# 여러 개면 순서대로 값을 합쳐서(예: 학번:이름) 한 사람으로 구분합니다.
+ID_SESSION_KEYS = ["student_code"]
+
+KST = timezone(timedelta(hours=9))
+TRACKS = ["선택 안 함", "인문", "사회", "자연", "공학", "의약", "예체능", "교육"]
+
+
+def _cfg(name: str, default: str = "") -> str:
+    """환경변수 -> st.secrets 순으로 설정값을 찾는다."""
+    v = os.environ.get(name)
+    if isinstance(v, str) and v:
+        return v
+    try:
+        s = st.secrets.get(name)
+        if isinstance(s, str) and s:
+            return s
+    except Exception:
+        pass
+    return default
+
+
+def _db_path() -> str:
+    return _cfg("CAREER_DB_PATH", "career_tab.db")
+
+
+def _salt() -> str:
+    return _cfg("CAREER_SALT", "change-me-please")
+
+
+# =====================================================================
+# 1. 대입 정보 API 연결 설정  (여기만 채우면 됩니다)
+# =====================================================================
+# 각 사이트 API를 받으면 아래 항목 하나를 복사해서 값을 채우세요.
+#   url            : API 주소 (비워두면 이 소스는 꺼진 상태)
+#   key_env        : API 키를 담은 환경변수 이름 / key_param : 키를 보내는 파라미터 이름
+#   query_param    : 검색어를 보내는 파라미터 이름
+#   fixed_params   : 항상 같이 보내는 값들
+#   format         : "json" 또는 "xml" (xml이면 item_tag 지정)
+#   list_path      : JSON 응답에서 결과 목록이 있는 경로
+#   title_fields / summary_fields / link_fields : 결과 한 건에서 꺼낼 필드 이름(앞에 있는 것 우선)
+SOURCES = [
+    {   # 한국대학교육협의회 대학알리미 - 대학 기본 정보 (대학 이름으로 검색)
+        # 인증키는 환경변수/secrets 의 DATA_GO_KR_KEY 에 넣습니다 (코드에 적지 마세요)
+        "name": "대학알리미 대학 기본 정보",
+        "home_url": "https://www.academyinfo.go.kr",
+        "url": "https://apis.data.go.kr/B340014/BasicInformationService_2/getComparisonUniversitySearchList",
+        "key_env": "DATA_GO_KR_KEY",
+        "key_param": "serviceKey",
+        "query_param": "schlKrnNm",                 # 학교 한글명
+        "fixed_params": {"pageNo": "1", "numOfRows": "5", "svyYr": "2024"},   # svyYr: 공시년도
+        "format": "xml",
+        "item_tag": "item",
+        "title_fields": ["schlFullNm", "schlKrnNm"],
+        # 예) 국립 · 강원 · 대학교 · 본교
+        "summary_template": "{estbDivNm} · {znNm} · {schlKndNm} · {clgcpDivNm}",
+        "link_fields": [],                          # 학교별 링크가 없어서 대학알리미 홈으로 연결
+        "max_items": 5,
+    },
+    {   # 전국대학별입학정원정보표준데이터 (대학 단위 입학정원과 계열별 정원. 학과별 정보는 없어요)
+        # 같은 DATA_GO_KR_KEY 를 씁니다. CRTR_YR(기준연도)는 새 자료가 올라오면 바꿔주세요.
+        "name": "대학별 입학정원",
+        "home_url": "https://www.data.go.kr/data/15107731/standard.do",
+        "url": "https://api.data.go.kr/openapi/tn_pubr_public_univ_mtcltn_api",
+        "key_env": "DATA_GO_KR_KEY",
+        "key_param": "serviceKey",
+        "query_param": "SCHL_NM",                   # 학교명
+        "fixed_params": {"pageNo": "1", "numOfRows": "5", "type": "xml", "CRTR_YR": "2025"},
+        "format": "xml",
+        "item_tag": "item",
+        "title_fields": ["SCHL_NM"],
+        # 값이 없거나 0인 계열은 자동으로 빠집니다. 예) 사립 · 경상북도 · 전문대학 · 본교 · 입학정원 516명 · 인문 24 · 사회 110 ...
+        "summary_template": ("{FNDN_SE_NM} · {CTPV_NM} · {SCHL_SE_NM} · {MAIN_BRAN_SCHL_SE_NM} · "
+                             "입학정원 {MTCLTN_CNT}명 · 인문 {ACAY_AFIL_MTCLTN_CNT} · 사회 {SOCTY_AFIL_MTCLTN_CNT} · "
+                             "교육 {EDU_AFIL_MTCLTN_CNT} · 공학 {ENGR_AFIL_MTCLTN_CNT} · 자연 {SCIEN_AFIL_MTCLTN_CNT} · "
+                             "의약 {MDSN_AFIL_MTCLTN_CNT} · 예체능 {ARTAPHY_AFIL_MTCLTN_CNT}"),
+        # 계열별 정원 막대그래프용 (앱의 희망 계열 이름 -> API 필드). 진로·진학 지도에서 '내 계열'을 강조해요.
+        "detail_total": "MTCLTN_CNT",
+        "detail_fields": {"인문": "ACAY_AFIL_MTCLTN_CNT", "사회": "SOCTY_AFIL_MTCLTN_CNT",
+                          "교육": "EDU_AFIL_MTCLTN_CNT", "공학": "ENGR_AFIL_MTCLTN_CNT",
+                          "자연": "SCIEN_AFIL_MTCLTN_CNT", "의약": "MDSN_AFIL_MTCLTN_CNT",
+                          "예체능": "ARTAPHY_AFIL_MTCLTN_CNT"},
+        "link_fields": [],
+        "max_items": 5,
+    },
+    {   # 빈 템플릿: url 을 채우면 자동으로 켜집니다.
+        "name": "대학 정보 (직접 추가)",
+        "home_url": "https://www.academyinfo.go.kr",
+        "url": "",
+        "key_env": "UNIV_API_KEY",
+        "key_param": "serviceKey",
+        "query_param": "q",
+        "fixed_params": {},
+        "format": "json",
+        "list_path": [],
+        "title_fields": ["title"],
+        "summary_fields": ["summary"],
+        "link_fields": ["url"],
+        "max_items": 5,
+    },
+]
+
+# API 연결 전에도, 연결 후에도 보여줄 원문 사이트 바로가기
+LINKS = [("어디가", "https://www.adiga.kr"), ("커리어넷", "https://www.career.go.kr"),
+         ("전공맵", "https://www.majormap.net"), ("대학알리미", "https://www.academyinfo.go.kr")]
+
+
+
+# =====================================================================
+# 2. 디자인 (토스 느낌 + 귀엽게) - 메인 앱 전체 스타일은 건드리지 않아요
+# =====================================================================
+CSS = """
+<style>
+.ct-card{background:#fff;border-radius:22px;padding:20px;box-shadow:0 2px 14px rgba(25,31,40,.06);margin-bottom:14px;}
+.ct-hero{background:linear-gradient(135deg,#3182F6 0%,#5BA0FF 100%);color:#fff;border-radius:26px;padding:24px;margin-bottom:14px;}
+.ct-hero .big{font-size:34px;font-weight:800;line-height:1.1;}
+.ct-hero .sub{opacity:.92;font-size:14px;margin-bottom:6px;}
+.ct-bar{height:10px;background:#E8EBF0;border-radius:6px;overflow:hidden;margin:8px 0 4px;}
+.ct-bar>div{height:100%;background:#3182F6;border-radius:6px;}
+.ct-chip{display:inline-block;padding:3px 10px;border-radius:99px;font-size:12px;font-weight:700;background:#EAF2FF;color:#3182F6;}
+.ct-chip.mint{background:#E3FBF8;color:#00A99D;}
+.ct-chip.gray{background:#F2F4F6;color:#6B7684;}
+.ct-muted{color:#8B95A1;font-size:13px;}
+.ct-title{font-size:18px;font-weight:800;color:#191F28;}
+.ct-row{display:flex;justify-content:space-between;align-items:center;gap:8px;}
+.ct-post-body{white-space:pre-wrap;font-size:14px;line-height:1.6;color:#333D4B;}
+.ct-src{font-weight:800;margin:14px 0 6px;color:#191F28;}
+.ct-item{padding:10px 0;border-bottom:1px solid #F0F1F3;}
+.ct-item:last-child{border-bottom:none;}
+</style>
+"""
+
+
+def _esc(x) -> str:
+    return html.escape(str(x), quote=True)
+
+
+def _card(inner_html: str) -> None:
+    st.markdown(f'<div class="ct-card">{inner_html}</div>', unsafe_allow_html=True)
+
+
+def _bar(pct: int) -> str:
+    return f'<div class="ct-bar"><div style="width:{max(0, min(100, pct))}%"></div></div>'
+
+
+def _today() -> date:
+    return datetime.now(KST).date()
+
+
+def _fmt_dur(sec: int) -> str:
+    h, m = int(sec) // 3600, (int(sec) % 3600) // 60
+    return f"{h}시간 {m}분" if h else f"{m}분"
+
+
+def _flash(msg: str) -> None:
+    st.session_state["ct_flash"] = msg
+
+
+# =====================================================================
+# 3. DB (이 탭이 쓰는 표는 두 개뿐이에요)
+# =====================================================================
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS career_profiles(
+  uid TEXT PRIMARY KEY, track TEXT DEFAULT '', major TEXT DEFAULT '', target_univ TEXT DEFAULT '');
+CREATE TABLE IF NOT EXISTS activities(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT, act_date TEXT, act_type TEXT, title TEXT,
+  content TEXT DEFAULT '', role TEXT DEFAULT '', reflection TEXT DEFAULT '', minutes INTEGER,
+  subjects TEXT DEFAULT '[]', careers TEXT DEFAULT '[]', created_at REAL);
+CREATE INDEX IF NOT EXISTS idx_activities_uid ON activities(uid, act_date);
+"""
+_inited_paths: set = set()
+
+
+@contextmanager
+def _db():
+    path = _db_path()
+    con = sqlite3.connect(path, timeout=10)
+    con.row_factory = sqlite3.Row
+    if path not in _inited_paths:
+        con.executescript(_SCHEMA)
+        _inited_paths.add(path)
+    try:
+        yield con
+        con.commit()
+    finally:
+        con.close()
+
+
+# =====================================================================
+# 4. 사용자 식별 (메인 앱 로그인 정보 -> 해시)
+# =====================================================================
+def hash_uid(identity: str) -> str:
+    """학번·이름 같은 식별값은 저장하지 않고, salt를 섞은 해시만 사용한다."""
+    return hashlib.sha256(f"{_salt()}:{str(identity).strip()}".encode("utf-8")).hexdigest()[:32]
+
+
+def _identity():
+    """메인 앱이 session_state 에 담아둔 값들을 합쳐 한 사람의 식별값으로 쓴다."""
+    parts = []
+    for k in ID_SESSION_KEYS:
+        v = st.session_state.get(k)
+        if not isinstance(v, (str, int)) or not str(v).strip():
+            return None
+        parts.append(str(v).strip())
+    return ":".join(parts) if parts else None
+
+
+def get_profile(uid: str) -> dict:
+    with _db() as con:
+        row = con.execute("SELECT * FROM career_profiles WHERE uid=?", (uid,)).fetchone()
+        if not row:
+            con.execute("INSERT INTO career_profiles(uid) VALUES(?)", (uid,))
+            return {"uid": uid, "track": "", "major": "", "target_univ": ""}
+        return dict(row)
+
+
+def update_profile(uid: str, track: str, major: str, univ: str) -> None:
+    get_profile(uid)
+    with _db() as con:
+        con.execute("UPDATE career_profiles SET track=?, major=?, target_univ=? WHERE uid=?",
+                    (track[:20] if track in TRACKS[1:] else "", major.strip()[:40], univ.strip()[:40], uid))
+
+
+def _dev_login(force: bool = False) -> None:
+    """혼자 테스트할 수 있게 로그인 값을 직접 입력하는 칸을 보여준다.
+    파일을 단독 실행할 때(force=True)나 CAREER_DEV=1 일 때만 나타나요."""
+    if (force or _cfg("CAREER_DEV") == "1") and not _identity():
+        labels = {0: "개발용 학번(또는 코드)", 1: "개발용 이름"}
+        vals = [st.text_input(labels.get(i, k), key=f"ct_dev_{k}") for i, k in enumerate(ID_SESSION_KEYS)]
+        if all(v.strip() for v in vals):
+            for k, v in zip(ID_SESSION_KEYS, vals):
+                st.session_state[k] = v.strip()
+            st.rerun()
+
+
+def _login_gate():
+    ident = _identity()
+    if not ident:
+        st.info("로그인하면 사용할 수 있어요 🙂")
+        return None
+    return get_profile(hash_uid(ident))
+
+
+# =====================================================================
+# 5. 대입 정보 조회 (API 어댑터)
+# =====================================================================
+_CACHE: dict = {}
+_CACHE_TTL = 3600
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _dig(obj, path):
+    for k in path:
+        if isinstance(obj, dict):
+            obj = obj.get(k)
+        elif isinstance(obj, list) and isinstance(k, int) and 0 <= k < len(obj):
+            obj = obj[k]
+        else:
+            return None
+    return obj
+
+
+def _norm_key(k) -> str:
+    """SCHL_NM, schlNm, schl_nm 처럼 쓰는 방식이 달라도 같은 이름으로 본다."""
+    return re.sub(r"[^a-z0-9]", "", str(k).lower())
+
+
+def _get(item: dict, name: str):
+    if not isinstance(item, dict):
+        return None
+    if name in item:
+        return item[name]
+    want = _norm_key(name)
+    for k, v in item.items():
+        if _norm_key(k) == want:
+            return v
+    return None
+
+
+def _pick(item: dict, fields: list[str]) -> str:
+    for f in fields:
+        v = _get(item, f)
+        if v not in (None, ""):
+            return _TAG_RE.sub("", str(v)).strip()
+    return ""
+
+
+def _xml_items(text: str, tag: str) -> list[dict]:
+    root = ET.fromstring(text)
+    return [{c.tag: (c.text or "").strip() for c in el} for el in root.iter(tag)]
+
+
+def _parse_items(text: str, src: dict) -> list[dict]:
+    if src.get("format", "json") == "xml":
+        raw = _xml_items(text, src.get("item_tag", "item"))
+    else:
+        node = _dig(json.loads(text), src.get("list_path", []))
+        raw = node if isinstance(node, list) else ([node] if isinstance(node, dict) else [])
+    home = src.get("home_url", "")
+    out = []
+    for it in raw[: src.get("max_items", 5)]:
+        title = _pick(it, src.get("title_fields", ["title"]))
+        if not title:
+            continue
+        link = _pick(it, src.get("link_fields", []))
+        if src.get("summary_template"):
+            # 여러 항목을 한 줄로 합친다. '·' 로 나눈 조각 중 값이 비었거나 0인 항목이 들어 있는 조각은 뺀다.
+            vals = []
+            for p in (x.strip() for x in src["summary_template"].split("·")):
+                names = re.findall(r"\{(\w+)\}", p)
+                got = [_TAG_RE.sub("", str(_get(it, nm) or "")).strip() for nm in names]
+                if names and any(g in ("", "0") for g in got):
+                    continue
+                vals.append(re.sub(r"\{(\w+)\}",
+                                   lambda m: _TAG_RE.sub("", str(_get(it, m.group(1)) or "")).strip(), p))
+            summary = " · ".join(v for v in vals if v)
+        else:
+            summary = _pick(it, src.get("summary_fields", []))
+        entry = {"title": title[:80],
+                 "summary": summary[:160],   # 요약 일부만 (원문은 출처에서)
+                 "url": link if link.startswith(("http://", "https://")) else home}
+        if src.get("detail_fields"):
+            entry["detail"] = {k: _to_int(_get(it, f)) for k, f in src["detail_fields"].items()}
+            entry["total"] = _to_int(_get(it, src.get("detail_total", "")))
+        out.append(entry)
+    return out
+
+
+def _to_int(v) -> int:
+    try:
+        return max(0, int(float(str(v).replace(",", "").strip())))
+    except (TypeError, ValueError):
+        return 0
+
+
+def track_share(detail: dict, total: int, track: str):
+    """희망 계열의 정원과 전체 대비 비율. 값이 없으면 None."""
+    n = (detail or {}).get(track, 0)
+    if not n or not total:
+        return None
+    return n, round(n * 100 / total)
+
+
+def fetch_source(src: dict, key: str, query: str) -> dict:
+    res = {"source": src["name"], "home": src.get("home_url", ""), "status": "ok", "items": []}
+    if not src.get("url"):
+        res["status"] = "off"
+        return res
+    if src.get("key_param") and not key:
+        res["status"] = "no_key"
+        return res
+    params = dict(src.get("fixed_params", {}))
+    params[src["query_param"]] = query
+    if src.get("key_param"):
+        # 공공데이터포털의 '인코딩 키'(%2B 등이 들어 있는 키)를 그대로 넣어도 두 번 인코딩되지 않게 풀어준다
+        params[src["key_param"]] = urlparse.unquote(key)
+    url = src["url"] + ("&" if "?" in src["url"] else "?") + urlparse.urlencode(params)
+    try:
+        req = urlrequest.Request(url, headers={"User-Agent": "study-helper/1.0"})
+        with urlrequest.urlopen(req, timeout=6) as r:
+            text = r.read().decode(src.get("encoding", "utf-8"), "replace")
+        if src.get("format") == "xml":
+            # 공공데이터포털은 키 오류 같은 문제도 XML 로 돌려준다 (resultCode 00 이 정상)
+            code = ET.fromstring(text).findtext(".//resultCode")
+            if code is not None and code.strip() not in ("00", "0", "000"):
+                res["status"] = "error"
+                return res
+        res["items"] = _parse_items(text, src)
+    except Exception:           # 키가 담긴 주소가 화면에 나오지 않도록 내용은 숨긴다
+        res["status"] = "error"
+        res["items"] = []
+    return res
+
+
+def search_all(query: str, sources: list[dict] | None = None) -> list[dict]:
+    q = query.strip()[:60]
+    if not q:
+        return []
+    sources = SOURCES if sources is None else sources
+    jobs = [(s, _cfg(s.get("key_env", "")) if s.get("key_env") else "") for s in sources]   # 키는 메인 스레드에서 읽기
+
+    def run(job):
+        s, key = job
+        ck = (s["name"], q)
+        hit = _CACHE.get(ck)
+        if hit and time.time() - hit[0] < _CACHE_TTL:
+            return hit[1]
+        r = fetch_source(s, key, q)
+        if r["status"] == "ok":
+            _CACHE[ck] = (time.time(), r)
+        return r
+
+    if not jobs:
+        return []
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        return list(ex.map(run, jobs))
+
+
+# =====================================================================
+# 6. 희망 진로와 교과를 잇는 기준 (활동을 '이어서 보는' 데에만 써요)
+#   ※ 대학·학과마다 다릅니다. 팀에서 공식 자료를 보고 자유롭게 고쳐 쓰세요.
+# =====================================================================
+LEVELS = {"핵심": 1.3, "중요": 1.15, "참고": 1.0}
+LEVEL_ORDER = ["핵심", "중요", "참고"]
+
+# 과목 이름에 아래 글자가 들어 있으면 그 분류로 본다 (분류에 없으면 '참고' 취급)
+SUBJECT_GROUPS = {
+    "수학": ["수학", "미적분", "기하", "확률", "대수"],
+    "과학": ["과학", "물리", "화학", "생명", "지구"],
+    "국어": ["국어", "문학", "독서", "화법", "언어"],
+    "영어": ["영어"],
+    "사회": ["사회", "역사", "한국사", "세계사", "동아시아사", "지리", "윤리", "경제", "정치"],
+}
+
+# 계열별 '시험 과목 분류' 우선순위 (희망 계열에서 비중이 큰 과목일수록 시험 우선순위가 올라가요)
+TRACK_GROUP_LEVEL = {
+    "공학": {"수학": "핵심", "과학": "핵심", "영어": "중요"},
+    "자연": {"수학": "핵심", "과학": "핵심", "영어": "중요"},
+    "의약": {"과학": "핵심", "수학": "중요", "영어": "중요"},
+    "인문": {"국어": "핵심", "영어": "핵심", "사회": "중요"},
+    "사회": {"국어": "핵심", "영어": "핵심", "수학": "중요", "사회": "중요"},
+    "교육": {},
+    "예체능": {"국어": "중요", "영어": "중요"},
+}
+
+# 계열별 일반 선택과목 가이드: (과목, 단계, 이유)
+# ※ 대학·학과·학년도마다 다릅니다. 팀에서 공식 자료로 확인해 고쳐 쓰세요.
+TRACK_ELECTIVES = {
+    "공학": [("미적분Ⅱ", "핵심", "공학 전공 수학의 바탕이 되는 과목이에요"),
+           ("물리학", "핵심", "공학 전공의 기초 과학 과목이에요"),
+           ("기하", "중요", "공간·벡터 개념이 전공 수학과 물리에서 자주 쓰여요"),
+           ("화학", "중요", "재료·에너지 분야에서 기초가 돼요")],
+    "자연": [("미적분Ⅱ", "핵심", "자연과학 전공 수학의 바탕이 돼요"),
+           ("희망 학과와 가까운 과학 과목(물리학·화학·생명과학·지구과학)", "핵심",
+            "전공과 가장 가까운 과학 과목을 깊게 배워두면 좋아요"),
+           ("기하", "중요", "수학 심화 개념을 넓혀줘요")],
+    "의약": [("생명과학", "핵심", "의약 계열에서 자주 필요한 과학 과목이에요"),
+           ("화학", "핵심", "의약 계열에서 자주 필요한 과학 과목이에요"),
+           ("미적분Ⅱ", "중요", "일부 대학은 수학 선택과목을 지정해요"),
+           ("물리학", "참고", "대학에 따라 포함돼요")],
+    "인문": [("문학", "핵심", "국어·인문 계열 학업의 바탕이에요"),
+           ("영어Ⅱ", "핵심", "인문 계열에서 영어 독해력이 꾸준히 쓰여요"),
+           ("독서와 작문", "중요", "읽고 쓰는 힘을 키워줘요"),
+           ("사회·역사 탐구 과목", "중요", "인문사회 전공의 배경지식이 돼요")],
+    "사회": [("영어Ⅱ", "핵심", "사회 계열에서 영어 독해력이 꾸준히 쓰여요"),
+           ("사회·경제 탐구 과목(경제, 정치와 법, 사회와 문화 등)", "핵심", "전공과 가까운 사회 과목이에요"),
+           ("확률과 통계", "중요", "사회과학 전공에서 통계를 자주 써요"),
+           ("문학", "중요", "국어 역량의 바탕이에요")],
+    "교육": [("희망 교과와 이어지는 심화 과목", "핵심", "교과교육 전공은 희망 교과와의 연결이 중요해요"),
+           ("국어·영어·수학 기본 과목", "중요", "교직의 기초 학력이에요")],
+    "예체능": [("전공과 이어지는 실기·이론 과목", "핵심", "전공과 직접 이어지는 과목이에요"),
+            ("국어·영어", "중요", "기본 학업 역량이에요")],
+}
+
+# 학과 이름에 키워드가 들어 있으면: (키워드들, 계열 힌트, 분류별 우선순위, 추가 선택과목)
+MAJOR_RULES = [
+    (("영어", "영문"), "인문", {"영어": "핵심"},
+     [("영어 독해와 작문", "핵심", "영어 관련 학과는 읽기·쓰기 역량이 바탕이에요"),
+      ("영어 발표와 토론", "중요", "말하기 역량을 키워줘요")]),
+    (("국어", "국문", "문예"), "인문", {"국어": "핵심"},
+     [("문학", "핵심", "국어 관련 학과의 바탕이에요"), ("독서와 작문", "핵심", "읽고 쓰는 힘을 키워줘요")]),
+    (("수학", "통계", "수리"), "자연", {"수학": "핵심"},
+     [("미적분Ⅱ", "핵심", "수학 계열의 바탕이에요"), ("확률과 통계", "중요", "통계·데이터 분야에서 쓰여요")]),
+    (("컴퓨터", "소프트웨어", "인공지능", "ai", "데이터"), "공학", {"수학": "핵심"},
+     [("정보", "핵심", "컴퓨터 계열의 기초 과목이에요"), ("미적분Ⅱ", "핵심", "알고리즘·AI의 수학적 바탕이에요")]),
+    (("전기", "전자", "반도체", "물리학", "기계", "항공", "로봇"), "공학", {"수학": "핵심", "과학": "핵심"},
+     [("물리학", "핵심", "전기·전자·기계 분야는 물리 개념을 많이 써요")]),
+    (("화학", "화공", "신소재", "재료"), "공학", {"과학": "핵심"},
+     [("화학", "핵심", "화학·재료 분야의 바탕이에요")]),
+    (("생명", "바이오", "의학", "의예", "약학", "간호", "치의", "수의", "한의"), "의약", {"과학": "핵심"},
+     [("생명과학", "핵심", "생명·의약 분야의 바탕이에요")]),
+    (("경제", "경영", "무역", "회계"), "사회", {"수학": "중요"},
+     [("확률과 통계", "핵심", "경제·경영 계열은 통계를 많이 써요"), ("경제", "중요", "전공 배경지식이 돼요")]),
+]
+
+def subject_group(name: str):
+    for g, kws in SUBJECT_GROUPS.items():
+        if any(k in name for k in kws):
+            return g
+    return None
+
+
+def resolve_guide(track: str, major: str) -> dict:
+    """희망 계열·학과로 선택과목 가이드와 과목 분류별 우선순위를 만든다."""
+    m = (major or "").strip().lower()
+    matched = [r for r in MAJOR_RULES if any(k in m for k in r[0])]
+    eff = track if track in TRACK_ELECTIVES else (matched[0][1] if matched else "")
+    levels = dict(TRACK_GROUP_LEVEL.get(eff, {}))
+    for r in matched:
+        for g, lv in r[2].items():            # 학과 규칙이 더 높은 단계면 그걸 따른다
+            if g not in levels or LEVEL_ORDER.index(lv) < LEVEL_ORDER.index(levels[g]):
+                levels[g] = lv
+    merged: dict = {}
+    for subj, lv, why in [*TRACK_ELECTIVES.get(eff, []), *[e for r in matched for e in r[3]]]:
+        if subj not in merged or LEVEL_ORDER.index(lv) < LEVEL_ORDER.index(merged[subj][0]):
+            merged[subj] = (lv, why)
+    items = sorted(({"subject": s, "level": v[0], "reason": v[1]} for s, v in merged.items()),
+                   key=lambda x: LEVEL_ORDER.index(x["level"]))
+    return {"track": eff, "group_levels": levels, "items": items}
+
+
+# =====================================================================
+# 7. 활동 기록 + 생기부 방향 정리 로직
+#   원칙: 학생이 직접 적은 기록을 '정리해서 보여주기'까지만 한다.
+#         생활기록부 평가, 합격 가능성, 좋고 나쁨은 판단하지 않는다.
+# =====================================================================
+ACTIVITY_TYPES = ["교과 발표", "수행평가", "특강", "동아리", "독서", "탐구", "대회", "진로 활동", "봉사", "기타"]
+ACTIVITY_SUBJECTS = ["국어", "수학", "영어", "사회", "과학", "정보", "예체능", "기타"]
+CAREER_TAGS = ["공학", "컴퓨터·AI", "자연과학", "의약·보건", "인문·언어", "사회·경영", "교육", "미디어", "예체능",
+               "환경", "기타"]
+TRACK_TO_TAG = {"공학": "공학", "자연": "자연과학", "의약": "의약·보건", "인문": "인문·언어", "사회": "사회·경영",
+                "교육": "교육", "예체능": "예체능"}
+# 희망 학과 이름에 아래 글자가 들어 있으면 그 진로 태그와 연결해서 본다 (팀에서 자유롭게 고쳐 쓰세요)
+MAJOR_TAG_KEYWORDS = {
+    "공학": ("공학", "전기", "전자", "기계", "반도체", "항공", "로봇", "신소재", "화공", "건축", "토목"),
+    "컴퓨터·AI": ("컴퓨터", "소프트웨어", "인공지능", "ai", "데이터", "정보"),
+    "자연과학": ("물리", "화학", "수학", "통계", "지구", "천문", "생명과학"),
+    "의약·보건": ("의학", "의예", "약학", "간호", "치의", "수의", "한의", "보건", "생명"),
+    "인문·언어": ("영어", "영문", "국어", "국문", "문예", "언어", "문학", "철학", "사학", "역사"),
+    "사회·경영": ("경제", "경영", "무역", "회계", "행정", "법학", "정치", "사회", "심리"),
+    "교육": ("교육", "사범", "교사"),
+    "미디어": ("미디어", "방송", "언론", "신문", "영상", "광고"),
+    "환경": ("환경", "에너지", "기후"),
+}
+MAX_ACTIVITIES = 300
+
+
+def goal_tags(track: str, major: str) -> list[str]:
+    """희망 계열·학과에서 '이어서 볼 진로 태그'를 뽑는다."""
+    tags = []
+    t = TRACK_TO_TAG.get(track)
+    if t:
+        tags.append(t)
+    m = (major or "").lower()
+    for tag, kws in MAJOR_TAG_KEYWORDS.items():
+        if tag not in tags and any(k in m for k in kws):
+            tags.append(tag)
+    return tags
+
+
+def goal_subject_groups(track: str, major: str) -> set:
+    """희망 계열·학과에서 '이어서 볼 교과 분류'(국어·수학·과학 …)를 뽑는다."""
+    g = resolve_guide(track, major)
+    groups = {k for k, lv in g["group_levels"].items() if lv in ("핵심", "중요")}
+    for it in g["items"]:
+        if it["level"] != "참고":
+            grp = subject_group(it["subject"])
+            if grp:
+                groups.add(grp)
+            if "정보" in it["subject"]:
+                groups.add("정보")
+    return groups
+
+
+def add_activity(uid: str, act_date, act_type: str, title: str, content: str = "", role: str = "",
+                 reflection: str = "", minutes=None, subjects=None, careers=None) -> tuple[bool, str]:
+    title, content, role, reflection = title.strip(), content.strip(), role.strip(), reflection.strip()
+    try:
+        d = date.fromisoformat(str(act_date))
+    except ValueError:
+        return False, "날짜를 확인해주세요."
+    if d > _today():
+        return False, "아직 오지 않은 날짜는 기록할 수 없어요."
+    if act_type not in ACTIVITY_TYPES:
+        return False, "활동 유형을 골라주세요."
+    if not 2 <= len(title) <= 40:
+        return False, "제목은 2~40자로 써주세요."
+    if len(content) > 500 or len(reflection) > 500:
+        return False, "내용과 느낀 점은 각각 500자까지 쓸 수 있어요."
+    if len(role) > 40:
+        return False, "역할은 40자까지 쓸 수 있어요."
+    try:
+        minutes = int(minutes) if minutes not in (None, "") else None
+    except (TypeError, ValueError):
+        minutes = None
+    if minutes is not None and not 0 < minutes <= 1440:
+        minutes = None
+    subs = [s for s in (subjects or []) if s in ACTIVITY_SUBJECTS]
+    cars = [c for c in (careers or []) if c in CAREER_TAGS]
+    with _db() as con:
+        if con.execute("SELECT COUNT(*) FROM activities WHERE uid=?", (uid,)).fetchone()[0] >= MAX_ACTIVITIES:
+            return False, "기록은 300개까지 저장할 수 있어요. 오래된 기록을 정리해주세요."
+        con.execute("INSERT INTO activities(uid,act_date,act_type,title,content,role,reflection,minutes,"
+                    "subjects,careers,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (uid, d.isoformat(), act_type, title, content, role, reflection, minutes,
+                     json.dumps(subs, ensure_ascii=False), json.dumps(cars, ensure_ascii=False), time.time()))
+    return True, "활동을 기록했어요!"
+
+
+def list_activities(uid: str) -> list[dict]:
+    with _db() as con:
+        rows = con.execute("SELECT * FROM activities WHERE uid=? ORDER BY act_date DESC, id DESC", (uid,)).fetchall()
+    out = []
+    for r in rows:
+        a = dict(r)
+        a["subjects"] = json.loads(a["subjects"] or "[]")
+        a["careers"] = json.loads(a["careers"] or "[]")
+        out.append(a)
+    return out
+
+
+def delete_activity(uid: str, activity_id: int) -> None:
+    with _db() as con:
+        con.execute("DELETE FROM activities WHERE id=? AND uid=?", (activity_id, uid))
+
+
+def guidance_summary(uid: str, track: str, major: str) -> dict:
+    """기록한 활동을 희망 계열·학과와 이어서 '정리'한다. 평가나 판단은 하지 않는다."""
+    acts = list_activities(uid)
+    tags = goal_tags(track, major)
+    groups = goal_subject_groups(track, major)
+    linked = []
+    for a in acts:
+        hs = [s for s in a["subjects"] if s in groups]
+        ht = [c for c in a["careers"] if c in tags]
+        if hs or ht:
+            linked.append({**a, "hit_subjects": hs, "hit_tags": ht})
+    by_type = Counter(a["act_type"] for a in acts)
+    by_subject = Counter(s for a in acts for s in a["subjects"])
+    by_career = Counter(c for a in acts for c in a["careers"])
+    flows: dict = {}
+    for tag, _n in by_career.most_common(3):
+        seq = sorted((a for a in acts if tag in a["careers"]), key=lambda a: (a["act_date"], a["id"]))
+        flows[tag] = seq
+    return {
+        "total": len(acts),
+        "minutes_total": sum(a["minutes"] or 0 for a in acts),
+        "by_type": {t: by_type[t] for t in ACTIVITY_TYPES if by_type[t]},
+        "by_subject": dict(by_subject.most_common()),
+        "by_career": dict(by_career.most_common()),
+        "empty_types": [t for t in ACTIVITY_TYPES if t != "기타" and not by_type[t]],
+        "goal_tags": tags,
+        "goal_groups": sorted(groups),
+        "linked": linked,
+        "linked_subjects": dict(Counter(s for a in linked for s in a["hit_subjects"]).most_common()),
+        "linked_tags": dict(Counter(c for a in linked for c in a["hit_tags"]).most_common()),
+        "flows": flows,
+    }
+
+
+# =====================================================================
+# 8. 화면
+# =====================================================================
+def _count_line(d: dict) -> str:
+    return " · ".join(f"{k} {v}" for k, v in d.items())
+
+
+def _guidance_tab(user: dict) -> None:
+    uid = user["uid"]
+    track, major = user["track"], user["major"]
+    goal = " ".join(x for x in [major, track and f"({track} 계열)"] if x) or "희망 진로"
+    S = guidance_summary(uid, track, major)
+
+    # --- 방향 정리 ---
+    if S["total"] == 0:
+        st.info("아직 기록한 활동이 없어요. 아래에서 발표, 특강, 탐구 같은 활동을 하나씩 적어보세요.")
+    else:
+        linked_n = len(S["linked"])
+        hours = f' · 활동 시간 {_fmt_dur(S["minutes_total"] * 60)}' if S["minutes_total"] else ""
+        st.markdown(
+            f'<div class="ct-hero"><div class="sub">{_esc(goal)}와 이어진 활동</div>'
+            f'<div class="big">{linked_n}개</div>'
+            f'<div class="sub" style="margin-top:6px;">전체 기록 {S["total"]}개{hours}</div></div>',
+            unsafe_allow_html=True)
+
+        rows = ""
+        if S["goal_tags"] or S["goal_groups"]:
+            rows += (f'<div class="ct-item"><div class="ct-muted">희망 진로와 연결해서 보는 기준</div>'
+                     f'<div>진로 {_esc(" · ".join(S["goal_tags"]) or "-")} / 교과 {_esc(" · ".join(S["goal_groups"]) or "-")}</div></div>')
+        else:
+            rows += ('<div class="ct-item"><div class="ct-muted">위의 \'내 목표 설정\'에 희망 계열이나 학과를 저장하면 '
+                     '기록과 이어서 정리해드려요.</div></div>')
+        if S["linked_tags"] or S["linked_subjects"]:
+            area = dict(S["linked_tags"])
+            for k, v in S["linked_subjects"].items():
+                area[k + " 교과"] = v
+            rows += (f'<div class="ct-item"><div class="ct-muted">이어진 활동의 영역</div>'
+                     f'<div>{_esc(_count_line(area))}</div></div>')
+        rows += (f'<div class="ct-item"><div class="ct-muted">활동 유형별 기록</div>'
+                 f'<div>{_esc(_count_line(S["by_type"]))}</div></div>')
+        if S["empty_types"]:
+            rows += (f'<div class="ct-item"><div class="ct-muted">아직 기록이 없는 유형</div>'
+                     f'<div>{_esc(" · ".join(S["empty_types"]))}</div></div>')
+        _card(f'<div class="ct-title">나의 활동 정리</div>{rows}')
+
+        if S["flows"]:
+            fl = ""
+            for tag, seq in S["flows"].items():
+                chain = " → ".join(
+                    f'{date.fromisoformat(a["act_date"]).month}/{date.fromisoformat(a["act_date"]).day} '
+                    f'{a["act_type"]}·{a["title"][:12]}' for a in seq[-5:])
+                fl += (f'<div class="ct-item"><div class="ct-row"><b>{_esc(tag)}</b>'
+                       f'<span class="ct-chip">{len(seq)}개</span></div><div class="ct-muted">{_esc(chain)}</div></div>')
+            _card(f'<div class="ct-title">관심 흐름</div><div class="ct-muted">같은 진로 태그를 단 활동을 날짜순으로 이어봤어요.</div>{fl}')
+
+        if S["linked"]:
+            li = "".join(
+                f'<div class="ct-item"><div class="ct-row"><b>{_esc(a["title"])}</b>'
+                f'<span class="ct-chip mint">{_esc(a["act_type"])}</span></div>'
+                f'<div class="ct-muted">{_esc(a["act_date"])} · '
+                f'{_esc(" · ".join(a["hit_tags"] + a["hit_subjects"]))}</div></div>' for a in S["linked"][:8])
+            _card(f'<div class="ct-title">희망 진로와 이어진 활동</div>{li}')
+
+    st.caption("🔒 기록은 나만 볼 수 있어요. 앱은 적어둔 활동을 정리해서 보여줄 뿐, 생활기록부 평가나 합격 가능성은 "
+               "판단하지 않아요. 실제 기재 여부와 방향은 담임·교과 선생님과 상의하세요.")
+
+    # --- 활동 기록 추가 ---
+    with st.expander("✏️ 활동 기록하기", expanded=S["total"] == 0):
+        with st.form("ga_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            a_date = c1.date_input("날짜", value=_today(), max_value=_today(), key="ga_date")
+            a_type = c2.selectbox("활동 유형", ACTIVITY_TYPES, key="ga_type")
+            a_title = st.text_input("제목", max_chars=40, placeholder="예: 수학 주제 발표", key="ga_title")
+            a_content = st.text_area("내용", max_chars=500, height=100,
+                                     placeholder="예: 함수의 실생활 활용을 조사해서 발표했어요", key="ga_content")
+            c3, c4 = st.columns(2)
+            a_role = c3.text_input("역할 (선택)", max_chars=40, placeholder="예: 발표자", key="ga_role")
+            a_min = c4.number_input("활동 시간(분, 선택)", min_value=0, max_value=1440, step=10, value=0, key="ga_min")
+            a_refl = st.text_area("느낀 점 (선택)", max_chars=500, height=80, key="ga_refl")
+            a_subj = st.multiselect("관련 교과", ACTIVITY_SUBJECTS, key="ga_subj")
+            a_car = st.multiselect("관련 진로", CAREER_TAGS, key="ga_car")
+            if st.form_submit_button("기록 저장", use_container_width=True):
+                ok, msg = add_activity(uid, a_date, a_type, a_title, a_content, a_role, a_refl,
+                                       a_min or None, a_subj, a_car)
+                if ok:
+                    _flash(msg)
+                    st.rerun()
+                else:
+                    st.warning(msg)
+
+    # --- 기록 목록 ---
+    acts = list_activities(uid)
+    if acts:
+        with st.expander(f"전체 기록 보기 ({len(acts)})"):
+            for a in acts:
+                tags = " · ".join(a["subjects"] + a["careers"])
+                st.markdown(
+                    f'<div class="ct-row"><b>{_esc(a["title"])}</b><span class="ct-chip gray">{_esc(a["act_type"])}</span></div>'
+                    f'<div class="ct-muted">{_esc(a["act_date"])}{" · " + _esc(tags) if tags else ""}</div>',
+                    unsafe_allow_html=True)
+                for label, key in (("내용", "content"), ("역할", "role"), ("느낀 점", "reflection")):
+                    if a[key]:
+                        st.markdown(f'<div class="ct-post-body"><b>{label}</b> {_esc(a[key])}</div>',
+                                    unsafe_allow_html=True)
+                if st.button("🗑 삭제", key=f"ga_del_{a['id']}"):
+                    delete_activity(uid, a["id"])
+                    st.rerun()
+                st.divider()
+
+
+def _enroll_html(it: dict, track: str) -> str:
+    """계열별 입학정원 막대. 희망 계열은 '내 희망'으로 표시해요."""
+    detail, total = it["detail"], it["total"]
+    rows = ""
+    for name, n in detail.items():
+        if not n:
+            continue
+        pct = round(n * 100 / total) if total else 0
+        chip = ' <span class="ct-chip">내 희망</span>' if name == track else ""
+        rows += (f'<div class="ct-item"><div class="ct-row"><span><b>{_esc(name)}</b>{chip}</span>'
+                 f'<span class="ct-muted">{n}명 · {pct}%</span></div>{_bar(pct)}</div>')
+    return rows
+
+
+def _univ_block(user: dict, S: dict) -> None:
+    """① 대학 정보(API) → ② 희망 계열로 이어 보기. 연결 고리는 '희망 계열'이에요."""
+    track, major, target = user["track"], user["major"], user["target_univ"]
+    goal = " ".join(x for x in [target, major or (track and f"{track} 계열")] if x) or "희망 진로"
+    st.markdown(f'<div class="ct-title" style="margin:8px 0;">{_esc(goal)}</div>', unsafe_allow_html=True)
+
+    with st.form("ct_career_form"):
+        q = st.text_input("대학 이름으로 찾아보기", value="", placeholder=target or "예: 서울대학교")
+        go = st.form_submit_button("🔍 찾아보기", use_container_width=True)
+    if go and (q.strip() or target):
+        st.session_state["ct_career"] = (q.strip() or target, search_all(q.strip() or target))
+    elif "ct_career" not in st.session_state and target:
+        st.session_state["ct_career"] = (target, search_all(target))
+
+    last = st.session_state.get("ct_career")
+    shares = []
+    if last:
+        query, results = last
+        st.markdown(f'<div class="ct-muted">“{_esc(query)}” 검색 결과</div>', unsafe_allow_html=True)
+        shown = False
+        for r in results:
+            if r["status"] == "off":
+                continue
+            shown = True
+            body = ""
+            if r["status"] == "ok" and r["items"]:
+                for it in r["items"]:
+                    summ = f'<div class="ct-muted">{_esc(it["summary"])}</div>' if it["summary"] else ""
+                    link = (f'<a href="{_esc(it["url"])}" target="_blank" rel="noopener">원문 보기 ↗</a>'
+                            if it["url"] else "")
+                    if it.get("detail") and any(it["detail"].values()):
+                        body += (f'<div class="ct-item"><b>{_esc(it["title"])}</b>'
+                                 f'<div class="ct-muted">입학정원 {it["total"]}명 · 계열별 정원</div>'
+                                 f'{_enroll_html(it, track)}{link}</div>')
+                        sh = track_share(it["detail"], it["total"], track)
+                        if sh:
+                            shares.append((it["title"], sh))
+                    else:
+                        body += f'<div class="ct-item"><b>{_esc(it["title"])}</b>{summ}{link}</div>'
+            elif r["status"] == "ok":
+                body = '<div class="ct-muted">관련 결과가 없어요.</div>'
+            elif r["status"] == "no_key":
+                body = '<div class="ct-muted">API 연결을 준비 중이에요.</div>'
+            else:
+                body = '<div class="ct-muted">지금은 불러오지 못했어요. 잠시 후 다시 시도해주세요.</div>'
+            _card(f'<div class="ct-src">📚 {_esc(r["source"])}</div>{body}')
+        if not shown:
+            _card('<div class="ct-muted">아직 연결된 정보 사이트가 없어요. 아래 바로가기로 직접 확인해보세요.</div>')
+        st.caption("정보는 각 사이트 기준이에요. 정확한 내용은 꼭 원문에서 확인하세요.")
+    else:
+        st.info("위에서 대학 이름을 검색하거나, '내 목표 설정'에 목표 대학을 저장해보세요.")
+
+    # --- 연결 카드: 같은 '계열'로 대학 정보와 내 기록을 한 줄에 놓는다 ---
+    if track and track != TRACKS[0]:
+        left = (f'{_esc(shares[0][0])} {_esc(track)} 계열 정원 <b>{shares[0][1][0]}명</b> '
+                f'(전체의 {shares[0][1][1]}%)') if shares else f'{_esc(track)} 계열 정원 정보는 대학을 검색하면 나와요'
+        right = f'{_esc(track)} 계열과 이어진 내 활동 <b>{len(S["linked"])}개</b> (전체 기록 {S["total"]}개)'
+        _card(f'<div class="ct-title">대학 정보와 내 기록 이어 보기</div>'
+              f'<div class="ct-item"><div class="ct-muted">대학</div><div>{left}</div></div>'
+              f'<div class="ct-item"><div class="ct-muted">나</div><div>{right}</div></div>')
+
+    st.markdown('<div class="ct-muted" style="margin-top:10px;">원문 사이트 바로가기</div>', unsafe_allow_html=True)
+    lc = st.columns(len(LINKS))
+    for c, (name, url) in zip(lc, LINKS):
+        c.link_button(name, url, use_container_width=True)
+
+
+def _pathway_tab(user: dict) -> None:
+    """진로·진학 지도: 대학 정보 + 내 활동 정리를 한 탭에서."""
+    S = guidance_summary(user["uid"], user["track"], user["major"])
+    _univ_block(user, S)
+    st.divider()
+    st.markdown('<div class="ct-title" style="margin:4px 0 8px;">🧭 나의 생기부 방향 정리</div>',
+                unsafe_allow_html=True)
+    _guidance_tab(user)
+
+
+# =====================================================================
+# 9. 메인 앱이 부르는 입구
+# =====================================================================
+def render_career_tab(dev_login: bool = False) -> None:
+    """진로·대입 연계 탭 전체. 메인 앱의 원하는 자리에서 한 줄로 부르세요."""
+    st.markdown(CSS, unsafe_allow_html=True)
+    _dev_login(force=dev_login)
+    user = _login_gate()
+    if not user:
+        return
+    toast = st.session_state.pop("ct_flash", None)
+    if toast:
+        st.toast(toast)
+    uid = user["uid"]
+
+    st.markdown('<div class="ct-title" style="margin:4px 0 12px;">🧭 진로·진학 지도</div>', unsafe_allow_html=True)
+    with st.expander("내 목표 설정", expanded=not user["major"]):
+        with st.form("ct_profile"):
+            idx = TRACKS.index(user["track"]) if user["track"] in TRACKS else 0
+            track = st.selectbox("희망 계열", TRACKS, index=idx)
+            major = st.text_input("희망 학과", value=user["major"], placeholder="예: 영어교육과")
+            univ = st.text_input("목표 대학 (선택)", value=user["target_univ"])
+            if st.form_submit_button("저장", use_container_width=True):
+                update_profile(uid, "" if track == TRACKS[0] else track, major, univ)
+                _flash("목표를 저장했어요.")
+                st.rerun()
+    _pathway_tab(user)
+
+
+def run_standalone() -> None:
+    st.set_page_config(page_title="진로·진학 지도", page_icon="🧭", layout="centered")
+    render_career_tab(dev_login=True)     # 단독 실행에서는 로그인 입력칸을 항상 보여줘요
+
+
+if __name__ == "__main__":
+    run_standalone()
